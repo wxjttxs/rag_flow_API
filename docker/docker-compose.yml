@@ -37,6 +37,13 @@ services:
       - ../history_data_agent:/ragflow/history_data_agent
       - ./service_conf.yaml.template:/ragflow/conf/service_conf.yaml.template
       - ./entrypoint.sh:/ragflow/entrypoint.sh
+      # Mount local code for development (changes take effect immediately)
+      - ../api:/ragflow/api
+      - ../rag:/ragflow/rag
+      - ../deepdoc:/ragflow/deepdoc
+      - ../agent:/ragflow/agent
+      - ../graphrag:/ragflow/graphrag
+      - ../agentic_reasoning:/ragflow/agentic_reasoning
     env_file: .env
     environment:
       - TZ=${TIMEZONE}

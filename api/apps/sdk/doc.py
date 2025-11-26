@@ -17,7 +17,9 @@ import datetime
 import logging
 import pathlib
 import re
+import time
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import xxhash
 from flask import request, send_file
@@ -1446,21 +1448,149 @@ def retrieval_test(tenant_id):
             chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
             question += keyword_extraction(chat_mdl, question)
 
-        ranks = settings.retrievaler.retrieval(
-            question,
-            embd_mdl,
-            tenant_ids,
-            kb_ids,
-            page,
-            size,
-            similarity_threshold,
-            vector_similarity_weight,
-            top,
-            doc_ids,
-            rerank_mdl=rerank_mdl,
-            highlight=highlight,
-            rank_feature=label_question(question, kbs),
-        )
+        # Check if we need concurrent retrieval for multiple datasets
+        retrieval_start_time = time.time()
+        logging.info(f"[Retrieval] Starting retrieval - dataset_ids: {kb_ids}, count: {len(kb_ids)}, "
+                    f"question: {question[:50]}..., mode: {'CONCURRENT' if len(kb_ids) > 1 else 'SINGLE'}")
+        
+        if len(kb_ids) > 1:
+            # Concurrent retrieval for multiple datasets
+            logging.info(f"[Retrieval] Using CONCURRENT mode for {len(kb_ids)} datasets: {kb_ids}")
+            
+            def retrieve_single_kb(kb_id):
+                """Retrieve chunks from a single knowledge base"""
+                single_start_time = time.time()
+                try:
+                    single_kb = [kb for kb in kbs if kb.id == kb_id][0]
+                    single_tenant_ids = [single_kb.tenant_id]
+                    # Filter doc_ids for this specific kb_id if doc_ids are provided
+                    single_doc_ids = None
+                    if doc_ids:
+                        # Get documents for this kb_id
+                        kb_doc_ids = KnowledgebaseService.list_documents_by_ids([kb_id])
+                        single_doc_ids = [doc_id for doc_id in doc_ids if doc_id in kb_doc_ids]
+                        if not single_doc_ids:
+                            single_doc_ids = None
+                    
+                    logging.debug(f"[Retrieval] Concurrent task started for kb_id: {kb_id}")
+                    
+                    # Use page=1 and larger size to get all results, then merge and re-paginate
+                    single_ranks = settings.retrievaler.retrieval(
+                        question,
+                        embd_mdl,
+                        single_tenant_ids,
+                        [kb_id],
+                        page=1,
+                        page_size=top,  # Get more results to merge later
+                        similarity_threshold=similarity_threshold,
+                        vector_similarity_weight=vector_similarity_weight,
+                        top=top,
+                        doc_ids=single_doc_ids,
+                        rerank_mdl=rerank_mdl,
+                        highlight=highlight,
+                        rank_feature=label_question(question, [single_kb]),
+                    )
+                    single_time = (time.time() - single_start_time) * 1000
+                    chunks_count = len(single_ranks.get("chunks", []))
+                    logging.info(f"[Retrieval] Concurrent task completed for kb_id: {kb_id}, "
+                              f"chunks: {chunks_count}, time: {single_time:.2f}ms")
+                    return single_ranks
+                except Exception as e:
+                    single_time = (time.time() - single_start_time) * 1000
+                    logging.error(f"[Retrieval] Error retrieving from kb_id {kb_id} (time: {single_time:.2f}ms): {str(e)}")
+                    return {"total": 0, "chunks": [], "doc_aggs": {}}
+            
+            # Execute concurrent retrieval
+            concurrent_start_time = time.time()
+            all_chunks = []
+            max_workers = min(len(kb_ids), 10)
+            logging.info(f"[Retrieval] Starting concurrent retrieval with ThreadPoolExecutor (max_workers={max_workers})")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_kb_id = {executor.submit(retrieve_single_kb, kb_id): kb_id for kb_id in kb_ids}
+                completed_count = 0
+                for future in as_completed(future_to_kb_id):
+                    kb_id = future_to_kb_id[future]
+                    try:
+                        single_ranks = future.result()
+                        chunks_count = len(single_ranks.get("chunks", []))
+                        all_chunks.extend(single_ranks.get("chunks", []))
+                        completed_count += 1
+                        logging.debug(f"[Retrieval] Merged results from kb_id: {kb_id}, chunks: {chunks_count}, "
+                                    f"total_chunks_so_far: {len(all_chunks)}")
+                    except Exception as e:
+                        logging.error(f"[Retrieval] Error processing result for kb_id {kb_id}: {str(e)}")
+            
+            concurrent_time = (time.time() - concurrent_start_time) * 1000
+            logging.info(f"[Retrieval] Concurrent retrieval completed - total_chunks: {len(all_chunks)}, "
+                        f"completed_tasks: {completed_count}/{len(kb_ids)}, time: {concurrent_time:.2f}ms")
+            
+            # Sort all chunks by similarity (descending)
+            sort_start_time = time.time()
+            all_chunks.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+            sort_time = (time.time() - sort_start_time) * 1000
+            logging.debug(f"[Retrieval] Sorted {len(all_chunks)} chunks by similarity, time: {sort_time:.2f}ms")
+            
+            # Apply similarity threshold filter
+            filtered_chunks = [c for c in all_chunks if c.get("similarity", 0) >= similarity_threshold]
+            total_count = len(filtered_chunks)
+            logging.info(f"[Retrieval] Applied similarity threshold ({similarity_threshold}) - "
+                        f"filtered: {total_count}/{len(all_chunks)} chunks")
+            
+            # Paginate the merged results
+            start_idx = (page - 1) * size
+            end_idx = start_idx + size
+            paginated_chunks = filtered_chunks[start_idx:end_idx]
+            logging.debug(f"[Retrieval] Paginated results - page: {page}, size: {size}, "
+                        f"showing chunks {start_idx} to {min(end_idx, total_count)}")
+            
+            # Build doc_aggs from paginated chunks (consistent with original behavior)
+            doc_aggs_dict = {}
+            for chunk in paginated_chunks:
+                dnm = chunk.get("docnm_kwd", "")
+                did = chunk.get("doc_id", "")
+                if dnm not in doc_aggs_dict:
+                    doc_aggs_dict[dnm] = {"doc_id": did, "count": 0}
+                doc_aggs_dict[dnm]["count"] += 1
+            
+            # Convert doc_aggs to list format
+            doc_aggs_list = [{"doc_name": k, "doc_id": v["doc_id"], "count": v["count"]} 
+                            for k, v in sorted(doc_aggs_dict.items(), key=lambda x: x[1]["count"] * -1)]
+            
+            ranks = {
+                "total": total_count,
+                "chunks": paginated_chunks,
+                "doc_aggs": doc_aggs_list
+            }
+            
+            total_time = (time.time() - retrieval_start_time) * 1000
+            logging.info(f"[Retrieval] CONCURRENT retrieval completed - total_time: {total_time:.2f}ms, "
+                        f"final_chunks: {len(paginated_chunks)}, total_matching: {total_count}")
+        else:
+            # Single dataset retrieval (original behavior)
+            logging.info(f"[Retrieval] Using SINGLE mode for dataset: {kb_ids[0]}")
+            single_start_time = time.time()
+            ranks = settings.retrievaler.retrieval(
+                question,
+                embd_mdl,
+                tenant_ids,
+                kb_ids,
+                page,
+                size,
+                similarity_threshold,
+                vector_similarity_weight,
+                top,
+                doc_ids,
+                rerank_mdl=rerank_mdl,
+                highlight=highlight,
+                rank_feature=label_question(question, kbs),
+            )
+            single_time = (time.time() - single_start_time) * 1000
+            total_time = (time.time() - retrieval_start_time) * 1000
+            logging.info(f"[Retrieval] SINGLE retrieval completed - dataset_id: {kb_ids[0]}, "
+                        f"chunks: {len(ranks.get('chunks', []))}, total: {ranks.get('total', 0)}, "
+                        f"retrieval_time: {single_time:.2f}ms, total_time: {total_time:.2f}ms")
+        
         if use_kg:
             ck = settings.kg_retrievaler.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, LLMType.CHAT))
             if ck["content_with_weight"]:

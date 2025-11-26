@@ -350,6 +350,67 @@ class RedisDB:
             self.__open__()
         return False
 
+    def scan_keys(self, pattern, count=1000):
+        """Scan keys matching pattern using SCAN command (non-blocking)."""
+        if not self.REDIS:
+            return []
+        try:
+            keys = []
+            cursor = 0
+            while True:
+                cursor, partial_keys = self.REDIS.scan(cursor, match=pattern, count=count)
+                keys.extend(partial_keys)
+                if cursor == 0:
+                    break
+            return keys
+        except Exception as e:
+            logging.warning(f"RedisDB.scan_keys {pattern} got exception: {str(e)}")
+            self.__open__()
+        return []
+
+    def get_ttl(self, key):
+        """Get TTL (time to live) of a key in seconds. Returns -1 if key exists but has no expiry, -2 if key doesn't exist."""
+        if not self.REDIS:
+            return -2
+        try:
+            return self.REDIS.ttl(key)
+        except Exception as e:
+            logging.warning(f"RedisDB.get_ttl {key} got exception: {str(e)}")
+            self.__open__()
+        return -2
+
+    def get_memory_usage(self, key):
+        """Get memory usage of a key in bytes using MEMORY USAGE command."""
+        if not self.REDIS:
+            return 0
+        try:
+            return self.REDIS.memory_usage(key)
+        except Exception as e:
+            # MEMORY USAGE might not be available in all Redis versions
+            logging.warning(f"RedisDB.get_memory_usage {key} got exception: {str(e)}")
+            # Fallback: estimate size by getting the value
+            try:
+                value = self.REDIS.get(key)
+                if value:
+                    # Rough estimate: key size + value size + overhead
+                    return len(key.encode('utf-8')) + len(value.encode('utf-8')) + 100
+            except:
+                pass
+        return 0
+
+    def delete_many(self, keys):
+        """Delete multiple keys in batch."""
+        if not self.REDIS or not keys:
+            return 0
+        try:
+            if len(keys) == 1:
+                return 1 if self.delete(keys[0]) else 0
+            return self.REDIS.delete(*keys)
+        except Exception as e:
+            logging.warning(f"RedisDB.delete_many got exception: {str(e)}")
+            self.__open__()
+        return 0
+
 
 REDIS_CONN = RedisDB()
 

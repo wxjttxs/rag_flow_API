@@ -14,6 +14,7 @@
 #  limitations under the License
 #
 import json
+import logging
 import os.path
 import pathlib
 import re
@@ -47,6 +48,9 @@ from deepdoc.parser.html_parser import RAGFlowHtmlParser
 from rag.nlp import search
 from rag.utils.storage_factory import STORAGE_IMPL
 
+# Initialize logger
+logger = logging.getLogger(__name__)
+
 
 @manager.route("/upload", methods=["POST"])  # noqa: F821
 @login_required
@@ -70,14 +74,57 @@ def upload():
         raise LookupError("Can't find this knowledgebase!")
     err, files = FileService.upload_document(kb, file_objs, current_user.id)
 
+    # Extract only the document metadata, not the blob data
+    docs = []
+    binary_data_warnings = []
+    
+    for doc, blob in files:
+        # Convert document object to dict and remove any binary data
+        if hasattr(doc, 'to_dict'):
+            doc_dict = doc.to_dict()
+        else:
+            doc_dict = doc if isinstance(doc, dict) else {}
+        
+        # Get filename for logging
+        filename = doc_dict.get('name', 'Unknown file')
+        has_binary_data = False
+        
+        # Remove any binary/blob fields that can't be JSON serialized
+        doc_dict.pop('blob', None)  # Remove blob field if it exists
+        
+        # Ensure all values are JSON serializable
+        for key, value in list(doc_dict.items()):
+            if isinstance(value, bytes):
+                has_binary_data = True
+                # Convert bytes to string representation or remove them
+                doc_dict[key] = f"<binary data {len(value)} bytes>"
+                logger.warning(f"File '{filename}' contains binary data in field '{key}' ({len(value)} bytes)")
+        
+        if has_binary_data:
+            binary_data_warnings.append(f"File '{filename}' contains binary data in one or more fields")
+        
+        docs.append(doc_dict)
+
+    # Build response message
+    messages = []
     if err:
-        return get_json_result(data=files, message="\n".join(err), code=settings.RetCode.SERVER_ERROR)
+        messages.extend(err)
+    if binary_data_warnings:
+        messages.extend(binary_data_warnings)
+    
+    message = "\n".join(messages) if messages else None
+    
+    if err:
+        return get_json_result(data=docs, message=message, code=settings.RetCode.SERVER_ERROR)
 
-    if not files:
-        return get_json_result(data=files, message="There seems to be an issue with your file format. Please verify it is correct and not corrupted.", code=settings.RetCode.DATA_ERROR)
-    files = [f[0] for f in files]  # remove the blob
+    if not docs:
+        return get_json_result(data=docs, message="There seems to be an issue with your file format. Please verify it is correct and not corrupted.", code=settings.RetCode.DATA_ERROR)
 
-    return get_json_result(data=files)
+    # Return success with warnings if any
+    if binary_data_warnings:
+        return get_json_result(data=docs, message=message)
+    
+    return get_json_result(data=docs)
 
 
 @manager.route("/web_crawl", methods=["POST"])  # noqa: F821

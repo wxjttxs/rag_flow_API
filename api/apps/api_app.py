@@ -14,8 +14,11 @@
 #  limitations under the License.
 #
 import json
+import logging
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from flask import request, Response
 from api.db.services.llm_service import LLMBundle
@@ -41,6 +44,14 @@ from api.utils.file_utils import filename_type, thumbnail
 from rag.app.tag import label_question
 from rag.prompts.generator import keyword_extraction
 from rag.utils.storage_factory import STORAGE_IMPL
+from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock
+from api.utils.cache_utils import (
+    generate_retrieval_cache_key,
+    get_retrieval_cache,
+    set_retrieval_cache,
+    RETRIEVAL_CACHE_PREFIX,
+    RETRIEVAL_CACHE_EXPIRY
+)
 
 from api.db.services.canvas_service import UserCanvasService
 from agent.canvas import Canvas
@@ -849,9 +860,17 @@ def completion_faq():
         return server_error_response(e)
 
 
+# Cache functions are now in api.utils.cache_utils to avoid circular dependencies
+
+
 @manager.route('/retrieval', methods=['POST'])  # noqa: F821
 @validate_request("kb_id", "question")
 def retrieval():
+    # Get thread information for logging
+    thread_id = threading.get_ident()
+    thread_name = threading.current_thread().name
+    request_start_time = time.time()
+    
     token = request.headers.get('Authorization').split()[1]
     objs = APIToken.query(token=token)
     if not objs:
@@ -867,7 +886,11 @@ def retrieval():
     similarity_threshold = float(req.get("similarity_threshold", 0.2))
     vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
     top = int(req.get("top_k", 1024))
-    highlight = bool(req.get("highlight", False)) 
+    highlight = bool(req.get("highlight", False))
+    
+    # Log request start
+    logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval request started - "
+                f"question: {question[:50]}..., kb_ids: {kb_ids}, page: {page}, size: {size}") 
 
     try:
         kbs = KnowledgebaseService.get_by_ids(kb_ids)
@@ -877,22 +900,150 @@ def retrieval():
                 data=False, message='Knowledge bases use different embedding models or does not exist."',
                 code=settings.RetCode.AUTHENTICATION_ERROR)
 
-        embd_mdl = LLMBundle(kbs[0].tenant_id, LLMType.EMBEDDING, llm_name=kbs[0].embd_id)
+        tenant_id = kbs[0].tenant_id
+        embd_mdl = LLMBundle(tenant_id, LLMType.EMBEDDING, llm_name=kbs[0].embd_id)
         rerank_mdl = None
-        if req.get("rerank_id"):
-            rerank_mdl = LLMBundle(kbs[0].tenant_id, LLMType.RERANK, llm_name=req["rerank_id"])
+        rerank_id = req.get("rerank_id")
+        if rerank_id:
+            rerank_mdl = LLMBundle(tenant_id, LLMType.RERANK, llm_name=rerank_id)
         if req.get("keyword", False):
-            chat_mdl = LLMBundle(kbs[0].tenant_id, LLMType.CHAT)
+            chat_mdl = LLMBundle(tenant_id, LLMType.CHAT)
             question += keyword_extraction(chat_mdl, question)
-        ranks = settings.retrievaler.retrieval(question, embd_mdl, kbs[0].tenant_id, kb_ids, page, size,
-                                               similarity_threshold, vector_similarity_weight, top,
-                                               doc_ids, rerank_mdl=rerank_mdl, highlight= highlight,
-                                               rank_feature=label_question(question, kbs))
-        for c in ranks["chunks"]:
-            c.pop("vector", None)
-        return get_json_result(data=ranks)
+        
+        # Generate cache key
+        cache_key = generate_retrieval_cache_key(
+            question, kb_ids, doc_ids, page, size, similarity_threshold,
+            vector_similarity_weight, top, rerank_id, highlight, tenant_id
+        )
+        
+        cache_check_start = time.time()
+        # Try to get from cache first
+        cached_result = get_retrieval_cache(cache_key)
+        cache_check_time = (time.time() - cache_check_start) * 1000  # Convert to milliseconds
+        
+        if cached_result is not None:
+            total_time = (time.time() - request_start_time) * 1000
+            logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval cache HIT - "
+                        f"cache_key: {cache_key[:32]}..., cache_check_time: {cache_check_time:.2f}ms, "
+                        f"total_time: {total_time:.2f}ms, chunks: {len(cached_result.get('chunks', []))}")
+            return get_json_result(data=cached_result)
+        
+        logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval cache MISS - "
+                    f"cache_key: {cache_key[:32]}..., cache_check_time: {cache_check_time:.2f}ms")
+        
+        # Use distributed lock to prevent concurrent queries for the same key
+        lock_key = f"retrieval_lock:{cache_key}"
+        distributed_lock = RedisDistributedLock(lock_key, timeout=300, blocking_timeout=5)
+        
+        # Try to acquire lock
+        lock_acquired = False
+        lock_acquire_start = time.time()
+        try:
+            lock_acquired = distributed_lock.acquire()
+            lock_acquire_time = (time.time() - lock_acquire_start) * 1000
+            
+            if lock_acquired:
+                logging.info(f"[Thread-{thread_id}|{thread_name}] Lock ACQUIRED - "
+                            f"lock_key: {lock_key[:50]}..., acquire_time: {lock_acquire_time:.2f}ms")
+                
+                # Double-check cache after acquiring lock (another thread might have set it)
+                double_check_start = time.time()
+                cached_result = get_retrieval_cache(cache_key)
+                double_check_time = (time.time() - double_check_start) * 1000
+                
+                if cached_result is not None:
+                    total_time = (time.time() - request_start_time) * 1000
+                    logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval cache HIT after lock - "
+                                f"cache_key: {cache_key[:32]}..., double_check_time: {double_check_time:.2f}ms, "
+                                f"total_time: {total_time:.2f}ms")
+                    return get_json_result(data=cached_result)
+                
+                # Perform retrieval
+                retrieval_start = time.time()
+                logging.info(f"[Thread-{thread_id}|{thread_name}] Performing retrieval - "
+                            f"cache_key: {cache_key[:32]}..., question: {question[:50]}...")
+                
+                ranks = settings.retrievaler.retrieval(question, embd_mdl, tenant_id, kb_ids, page, size,
+                                                       similarity_threshold, vector_similarity_weight, top,
+                                                       doc_ids, rerank_mdl=rerank_mdl, highlight=highlight,
+                                                       rank_feature=label_question(question, kbs))
+                
+                retrieval_time = (time.time() - retrieval_start) * 1000
+                
+                for c in ranks["chunks"]:
+                    c.pop("vector", None)
+                
+                # Cache the result
+                cache_set_start = time.time()
+                set_retrieval_cache(cache_key, ranks)
+                cache_set_time = (time.time() - cache_set_start) * 1000
+                
+                total_time = (time.time() - request_start_time) * 1000
+                logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval COMPLETED - "
+                            f"cache_key: {cache_key[:32]}..., retrieval_time: {retrieval_time:.2f}ms, "
+                            f"cache_set_time: {cache_set_time:.2f}ms, chunks: {len(ranks.get('chunks', []))}, "
+                            f"total_time: {total_time:.2f}ms")
+                
+                return get_json_result(data=ranks)
+            else:
+                logging.warning(f"[Thread-{thread_id}|{thread_name}] Lock ACQUIRE FAILED - "
+                              f"lock_key: {lock_key[:50]}..., acquire_time: {lock_acquire_time:.2f}ms, "
+                              f"waiting for other thread to complete...")
+                
+                # Failed to acquire lock, wait a bit and check cache again
+                wait_start = time.time()
+                time.sleep(0.1)
+                wait_time = (time.time() - wait_start) * 1000
+                
+                cached_result = get_retrieval_cache(cache_key)
+                if cached_result is not None:
+                    total_time = (time.time() - request_start_time) * 1000
+                    logging.info(f"[Thread-{thread_id}|{thread_name}] Retrieval cache HIT after lock timeout - "
+                                f"cache_key: {cache_key[:32]}..., wait_time: {wait_time:.2f}ms, "
+                                f"total_time: {total_time:.2f}ms")
+                    return get_json_result(data=cached_result)
+                
+                # If still no cache, perform retrieval without lock (fallback)
+                retrieval_start = time.time()
+                logging.warning(f"[Thread-{thread_id}|{thread_name}] Performing retrieval WITHOUT lock (fallback) - "
+                              f"cache_key: {cache_key[:32]}...")
+                
+                ranks = settings.retrievaler.retrieval(question, embd_mdl, tenant_id, kb_ids, page, size,
+                                                       similarity_threshold, vector_similarity_weight, top,
+                                                       doc_ids, rerank_mdl=rerank_mdl, highlight=highlight,
+                                                       rank_feature=label_question(question, kbs))
+                
+                retrieval_time = (time.time() - retrieval_start) * 1000
+                
+                for c in ranks["chunks"]:
+                    c.pop("vector", None)
+                
+                total_time = (time.time() - request_start_time) * 1000
+                logging.warning(f"[Thread-{thread_id}|{thread_name}] Retrieval COMPLETED (fallback) - "
+                              f"cache_key: {cache_key[:32]}..., retrieval_time: {retrieval_time:.2f}ms, "
+                              f"total_time: {total_time:.2f}ms")
+                
+                return get_json_result(data=ranks)
+        finally:
+            if lock_acquired:
+                lock_release_start = time.time()
+                distributed_lock.release()
+                lock_release_time = (time.time() - lock_release_start) * 1000
+                logging.debug(f"[Thread-{thread_id}|{thread_name}] Lock RELEASED - "
+                            f"lock_key: {lock_key[:50]}..., release_time: {lock_release_time:.2f}ms")
     except Exception as e:
+        total_time = (time.time() - request_start_time) * 1000
+        thread_id = threading.get_ident()
+        thread_name = threading.current_thread().name
+        
         if str(e).find("not_found") > 0:
+            logging.warning(f"[Thread-{thread_id}|{thread_name}] Retrieval ERROR (not_found) - "
+                          f"question: {question[:50] if question else 'N/A'}..., "
+                          f"total_time: {total_time:.2f}ms")
             return get_json_result(data=False, message='No chunk found! Check the chunk status please!',
                                    code=settings.RetCode.DATA_ERROR)
+        
+        logging.error(f"[Thread-{thread_id}|{thread_name}] Retrieval EXCEPTION - "
+                     f"question: {question[:50] if question else 'N/A'}..., "
+                     f"error: {str(e)}, total_time: {total_time:.2f}ms", exc_info=True)
         return server_error_response(e)

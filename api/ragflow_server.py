@@ -151,6 +151,31 @@ if __name__ == '__main__':
         app.config["MAIL_DEFAULT_SENDER"] = settings.MAIL_DEFAULT_SENDER
         smtp_mail_server.init_app(app)
 
+    # Start retrieval cache cleanup task
+    def delayed_start_cache_cleanup():
+        logging.info("Starting retrieval cache cleanup task (delayed)")
+        
+        def periodic_cleanup():
+            """Periodic cache cleanup task - runs every 6 hours"""
+            # Import from utils module to avoid circular dependency
+            from api.utils.cache_utils import cleanup_retrieval_cache
+            while not stop_event.is_set():
+                try:
+                    cleanup_retrieval_cache()
+                except Exception as e:
+                    logging.exception(f"Error in periodic cache cleanup: {str(e)}")
+                # Wait 6 hours before next cleanup
+                stop_event.wait(6 * 3600)
+        
+        t = threading.Thread(target=periodic_cleanup, daemon=True)
+        t.start()
+
+    if RuntimeConfig.DEBUG:
+        if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+            threading.Timer(60.0, delayed_start_cache_cleanup).start()
+    else:
+        threading.Timer(60.0, delayed_start_cache_cleanup).start()
+
 
     # start http server
     try:

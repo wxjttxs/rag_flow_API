@@ -5,7 +5,7 @@ services:
       - elasticsearch
     image: elasticsearch:${STACK_VERSION}
     volumes:
-      - /mnt/data6t/ragflow_esdata:/usr/share/elasticsearch/data
+      - esdata01:/usr/share/elasticsearch/data
     ports:
       - ${ES_PORT}:9200
     env_file: .env
@@ -209,37 +209,19 @@ services:
 
 
 volumes:
+  esdata01:
+    driver: local
   osdata01:
     driver: local
   infinity_data:
     driver: local
   mysql_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data6t/ragflow_mysql
   minio_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data6t/ragflow_minio
   redis_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data6t/ragflow_redis
-
-  esdata01:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data6t/ragflow_esdata
 
 networks:
   ragflow:
     driver: bridge
-
